@@ -6,6 +6,13 @@ FROM node:22-alpine AS frontend-build
 
 WORKDIR /app/frontend
 
+# Supabase frontend configuration
+ARG VITE_SUPABASE_URL
+ARG VITE_SUPABASE_ANON_KEY
+
+ENV VITE_SUPABASE_URL=${VITE_SUPABASE_URL}
+ENV VITE_SUPABASE_ANON_KEY=${VITE_SUPABASE_ANON_KEY}
+
 COPY frontend/package*.json ./
 
 RUN npm install
