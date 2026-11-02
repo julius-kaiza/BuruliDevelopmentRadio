@@ -1,28 +1,58 @@
 
-FROM node:22-alpine
+# ==========================================
+# STAGE 1: Build React frontend
+# ==========================================
+FROM node:22-alpine AS frontend-build
+
+WORKDIR /app/frontend
+
+COPY frontend/package*.json ./
+
+RUN npm install
+
+COPY frontend/ ./
+
+RUN npm run build
+
+
+# ==========================================
+# STAGE 2: Build Node.js backend
+# ==========================================
+FROM node:22-alpine AS backend-build
 
 WORKDIR /app/backend
 
-# Copy package configuration
 COPY backend/package*.json ./
 
-# Install all dependencies, including TypeScript
 RUN npm install
 
-# Copy backend source code
 COPY backend/ ./
 
-# Compile TypeScript into dist/
 RUN npm run build
 
-# Remove development dependencies
-RUN npm prune --omit=dev
 
-# Production configuration
+# ==========================================
+# STAGE 3: Production application
+# ==========================================
+FROM node:22-alpine AS production
+
+WORKDIR /app/backend
+
 ENV NODE_ENV=production
+ENV PORT=10000
 
-# Render supplies its own PORT
+# Backend package configuration
+COPY backend/package*.json ./
+
+# Install production dependencies
+RUN npm install --omit=dev
+
+# Copy compiled backend
+COPY --from=backend-build /app/backend/dist ./dist
+
+# Copy frontend production files
+COPY --from=frontend-build /app/frontend/dist ./public
+
 EXPOSE 10000
 
-# Start the application
 CMD ["npm", "start"]
