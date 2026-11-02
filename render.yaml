@@ -1,0 +1,60 @@
+services:
+  - type: web
+    name: buruli-development-radio-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install --no-audit && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22.22.0
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: ROOT_ADMIN_EMAIL
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: RECORDING_BUCKET
+        sync: false
+      - key: RECORDING_REGION
+        value: auto
+      - key: RECORDING_ENDPOINT
+        sync: false
+      - key: RECORDING_ACCESS_KEY
+        sync: false
+      - key: RECORDING_SECRET_KEY
+        sync: false
+      - key: RECORDING_PUBLIC_BASE_URL
+        sync: false
+  - type: web
+    name: buruli-development-radio
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci --no-audit && npm run build
+    staticPublishPath: dist
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22.22.0
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: VITE_API_BASE_URL
+        sync: false
+      - key: VITE_WHATSAPP_GROUP_URL
+        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
