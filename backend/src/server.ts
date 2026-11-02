@@ -22,6 +22,8 @@ import {
 
 import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
+import { resolve, join } from 'node:path'
+import { existsSync } from 'node:fs'
 
 // ======================================================
 // ENVIRONMENT CONFIGURATION
@@ -37,7 +39,7 @@ function requiredEnv(name: string): string {
   return value
 }
 
-const PORT = Number(process.env.PORT || 8787)
+const PORT = Number(process.env.PORT || 10000)
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
   throw new Error('PORT must be a valid port number')
@@ -53,10 +55,10 @@ const LIVEKIT_API_SECRET = requiredEnv('LIVEKIT_API_SECRET')
 const ROOT_ADMIN_EMAIL = process.env.ROOT_ADMIN_EMAIL?.trim().toLowerCase()
 
 const FRONTEND_ORIGINS = (
-  process.env.FRONTEND_ORIGIN || 'http://localhost:5173'
+  process.env.FRONTEND_ORIGIN || ''
 )
   .split(',')
-  .map(value => value.trim())
+  .map(value => value.trim().replace(/\/$/, ''))
   .filter(Boolean)
 
 const RECORDING_BUCKET = process.env.RECORDING_BUCKET?.trim()
@@ -116,6 +118,16 @@ const egressClient = new EgressClient(
 )
 
 // ======================================================
+// FRONTEND CONFIGURATION
+// ======================================================
+
+const PUBLIC_DIR = resolve(process.cwd(), 'public')
+const INDEX_FILE = join(PUBLIC_DIR, 'index.html')
+
+console.log('Frontend directory:', PUBLIC_DIR)
+console.log('Frontend index exists:', existsSync(INDEX_FILE))
+
+// ======================================================
 // TYPES
 // ======================================================
 
@@ -166,19 +178,43 @@ const PRIVILEGED_BROADCAST_ROLES: UserRole[] = [
 const app = express()
 
 app.set('trust proxy', 1)
-
 app.disable('x-powered-by')
 
 app.use(helmet())
 
 app.use(express.json({ limit: '1mb' }))
 
+// ======================================================
+// CORS
+// ======================================================
+
 app.use(
   cors({
     credentials: true,
+
     origin(origin, callback) {
-      if (!origin || FRONTEND_ORIGINS.includes(origin)) {
+      // Requests without an Origin header are permitted.
+      if (!origin) {
         return callback(null, true)
+      }
+
+      const normalizedOrigin = origin.replace(/\/$/, '')
+
+      // Explicitly configured frontend origins.
+      if (FRONTEND_ORIGINS.includes(normalizedOrigin)) {
+        return callback(null, true)
+      }
+
+      // Allow the same Render domain hosting this application.
+      try {
+        const originHost = new URL(origin).host
+        const requestHost = app.get('requestHost')
+
+        if (requestHost && originHost === requestHost) {
+          return callback(null, true)
+        }
+      } catch {
+        // Invalid origin is rejected below.
       }
 
       return callback(new Error('Origin not allowed by CORS'))
@@ -186,12 +222,33 @@ app.use(
   })
 )
 
+// Set the actual request host for same-origin CORS checks.
+app.use((req, _res, next) => {
+  app.set('requestHost', req.get('host'))
+  next()
+})
+
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 300,
     standardHeaders: 'draft-8',
     legacyHeaders: false
+  })
+)
+
+// ======================================================
+// FRONTEND STATIC FILES
+// ======================================================
+
+// Serve React JavaScript, CSS, images, fonts and other assets.
+// index:false ensures Express does not automatically override
+// the explicit root route below.
+
+app.use(
+  express.static(PUBLIC_DIR, {
+    index: false,
+    fallthrough: true
   })
 )
 
@@ -227,6 +284,22 @@ function isAdmin(role: UserRole): boolean {
 function isPrivilegedBroadcaster(role: UserRole): boolean {
   return PRIVILEGED_BROADCAST_ROLES.includes(role)
 }
+
+// ======================================================
+// FRONTEND HOME PAGE
+// ======================================================
+
+app.get('/', (_req, res, next) => {
+  if (!existsSync(INDEX_FILE)) {
+    return res.status(503).send(
+      'Buruli Development Radio frontend is not available. Check the frontend build and Docker deployment.'
+    )
+  }
+
+  res.sendFile(INDEX_FILE, error => {
+    if (error) next(error)
+  })
+})
 
 // ======================================================
 // AUTHENTICATION
@@ -344,14 +417,6 @@ app.get('/api/health', (_req, res) => {
     success: true,
     status: 'online',
     service: 'Buruli Development Radio API'
-  })
-})
-
-app.get('/', (_req, res) => {
-  res.json({
-    name: 'Buruli Development Radio',
-    message: 'Radio API is running',
-    health: '/health'
   })
 })
 
@@ -1095,6 +1160,48 @@ async function bootstrapRootAdmin() {
 }
 
 // ======================================================
+// REACT SINGLE-PAGE APPLICATION ROUTING
+// ======================================================
+
+// All API endpoints above are registered first.
+// This fallback serves React for browser page routes.
+
+app.use((req, res, next) => {
+  if (
+    req.method !== 'GET' ||
+    req.path === '/health' ||
+    req.path.startsWith('/api/') ||
+    req.path === '/api'
+  ) {
+    return next()
+  }
+
+  if (!req.accepts('html')) {
+    return next()
+  }
+
+  if (!existsSync(INDEX_FILE)) {
+    return next()
+  }
+
+  res.sendFile(INDEX_FILE, error => {
+    if (error) next(error)
+  })
+})
+
+// ======================================================
+// 404 HANDLER
+// ======================================================
+
+app.use((req, res) => {
+  return res.status(404).json({
+    success: false,
+    error: 'Resource not found',
+    path: req.path
+  })
+})
+
+// ======================================================
 // ERROR HANDLER
 // ======================================================
 
@@ -1104,7 +1211,7 @@ app.use((
   res: Response,
   _next: NextFunction
 ) => {
-  console.error('Unhandled API error:', error)
+  console.error('Unhandled application error:', error)
 
   if (res.headersSent) return
 
@@ -1120,14 +1227,16 @@ app.use((
 
 const server = createServer(app)
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log('')
   console.log('========================================')
-  console.log(' BURULI DEVELOPMENT RADIO API')
+  console.log(' BURULI DEVELOPMENT RADIO')
   console.log('========================================')
   console.log(`Server running on port ${PORT}`)
+  console.log(`Frontend directory: ${PUBLIC_DIR}`)
+  console.log(`Frontend available: ${existsSync(INDEX_FILE)}`)
   console.log(`LiveKit: ${LIVEKIT_URL}`)
-  console.log(`Supabase: Configured`)
+  console.log('Supabase: Configured')
   console.log(
     `Recording storage: ${RECORDING_CONFIGURED ? 'Configured' : 'Not configured'}`
   )
@@ -1145,7 +1254,7 @@ function shutdown(signal: string) {
   console.log(`${signal} received. Shutting down...`)
 
   server.close(() => {
-    console.log('Buruli Development Radio API stopped')
+    console.log('Buruli Development Radio stopped')
     process.exit(0)
   })
 
