@@ -1,3 +1,4 @@
+
 import 'dotenv/config'
 
 import express, {
@@ -32,9 +33,7 @@ function requiredEnv(name: string): string {
   const value = process.env[name]?.trim()
 
   if (!value) {
-    throw new Error(
-      `Missing required environment variable: ${name}`
-    )
+    throw new Error(`Missing required environment variable: ${name}`)
   }
 
   return value
@@ -89,6 +88,7 @@ if (recordingSettings.some(Boolean) && !RECORDING_CONFIGURED) {
 }
 
 // Validate Supabase URL.
+
 let supabaseOrigin: string
 
 try {
@@ -104,6 +104,7 @@ try {
 }
 
 // Validate LiveKit URL.
+
 let livekitParsedUrl: URL
 
 try {
@@ -120,6 +121,7 @@ try {
 }
 
 // Convert LiveKit WebSocket URL to HTTP for Egress.
+
 const LIVEKIT_HTTP_URL = LIVEKIT_URL
   .replace(/^wss:\/\//i, 'https://')
   .replace(/^ws:\/\//i, 'http://')
@@ -156,10 +158,6 @@ const INDEX_FILE = join(PUBLIC_DIR, 'index.html')
 // 4. CONTENT SECURITY POLICY
 // ======================================================
 
-// Add both HTTP and WebSocket origins for configured services.
-// Supabase Realtime uses secure WebSockets.
-// LiveKit uses WebSocket signalling and HTTPS endpoints.
-
 function getCspServiceOrigins(serviceUrl: string): string[] {
   const parsed = new URL(serviceUrl)
   const sources = [parsed.origin]
@@ -189,9 +187,17 @@ const connectSources = [
   ...getCspServiceOrigins(LIVEKIT_URL)
 ]
 
-const uniqueConnectSources = [
-  ...new Set(connectSources)
-]
+// Allow the recording storage endpoint when configured.
+
+if (RECORDING_ENDPOINT) {
+  try {
+    connectSources.push(new URL(RECORDING_ENDPOINT).origin)
+  } catch {
+    throw new Error('RECORDING_ENDPOINT must be a valid URL')
+  }
+}
+
+const uniqueConnectSources = [...new Set(connectSources)]
 
 // ======================================================
 // 5. EXPRESS APPLICATION
@@ -202,13 +208,13 @@ const app = express()
 app.set('trust proxy', 1)
 app.disable('x-powered-by')
 
-// IMPORTANT:
-// Explicitly allow Supabase and LiveKit in connect-src.
-// This fixes the previous default-src 'self' restriction.
+// CSP explicitly allows the configured external services.
+// It does not disable the browser's security policy.
 
 app.use(
   helmet({
     contentSecurityPolicy: {
+      useDefaults: true,
       directives: {
         defaultSrc: ["'self'"],
 
@@ -227,12 +233,12 @@ app.use(
         styleSrc: [
           "'self'",
           "'unsafe-inline'",
-          'https:'
+          'https://fonts.googleapis.com'
         ],
 
         fontSrc: [
           "'self'",
-          'https:',
+          'https://fonts.gstatic.com',
           'data:'
         ],
 
@@ -248,7 +254,8 @@ app.use(
         mediaSrc: [
           "'self'",
           'https:',
-          'blob:'
+          'blob:',
+          'data:'
         ],
 
         workerSrc: [
@@ -264,70 +271,73 @@ app.use(
 // 6. CORS CONFIGURATION
 // ======================================================
 
+// For a separate frontend service, configure FRONTEND_ORIGIN
+// with its exact HTTPS origin in Render.
+//
+// Same-origin requests do not require CORS permission.
+
 app.use(
-  cors({
-    credentials: true,
+  cors((req, callback) => {
+    const origin = req.header('Origin')
 
-    methods: [
-      'GET',
-      'POST',
-      'PUT',
-      'PATCH',
-      'DELETE',
-      'OPTIONS'
-    ],
+    if (!origin) {
+      return callback(null, { origin: false })
+    }
 
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'apikey',
-      'x-client-info'
-    ],
+    let normalizedOrigin: string
 
-    origin(origin, callback) {
-      // Permit server-to-server and command-line requests.
-      if (!origin) {
-        return callback(null, true)
-      }
+    try {
+      normalizedOrigin = new URL(origin).origin
+    } catch {
+      return callback(new Error('Invalid request origin'))
+    }
 
+    if (FRONTEND_ORIGINS.includes(normalizedOrigin)) {
+      return callback(null, {
+        origin: normalizedOrigin,
+        credentials: true,
+        methods: [
+          'GET',
+          'POST',
+          'PUT',
+          'PATCH',
+          'DELETE',
+          'OPTIONS'
+        ],
+        allowedHeaders: [
+          'Content-Type',
+          'Authorization',
+          'apikey',
+          'x-client-info'
+        ]
+      })
+    }
+
+    // Allow the same host when frontend and backend
+    // are served by the same application.
+
+    const requestHost = req.get('host')
+
+    if (requestHost) {
       try {
-        const normalizedOrigin = new URL(origin).origin
+        const requestUrl = new URL(
+          `${req.protocol}://${requestHost}`
+        )
 
-        // Explicitly configured frontend origins.
-        if (FRONTEND_ORIGINS.includes(normalizedOrigin)) {
-          return callback(null, true)
-        }
-
-        // Permit same-origin requests.
-        // This uses the current request, not a global app setting.
-        const requestHost = app.locals.requestHost
-
-        if (requestHost && new URL(origin).host === requestHost) {
-          return callback(null, true)
+        if (requestUrl.origin === normalizedOrigin) {
+          return callback(null, {
+            origin: normalizedOrigin,
+            credentials: true
+          })
         }
       } catch {
-        // Invalid origins are rejected below.
+        // Reject invalid request hosts.
       }
-
-      return callback(
-        new Error('Origin not allowed by CORS')
-      )
     }
+
+    return callback(new Error('Origin not allowed by CORS'))
   })
 )
-
-// Record the current request host before the CORS check
-// on subsequent requests.
-
-app.use((req, _res, next) => {
-  app.locals.requestHost = req.get('host')
-  next()
-})
-
-// NOTE:
-// The CORS middleware above uses the current host only when
-// app.locals.requestHost has been populated. Explicit
-// FRONTEND_ORIGIN is therefore required for separate sites.
 
 app.use(express.json({ limit: '1mb' }))
 
@@ -375,6 +385,10 @@ function getBearerToken(req: Request): string | null {
 
   return header.slice(7).trim() || null
 }
+
+// ======================================================
+// 9. TYPES AND ROLES
+// ======================================================
 
 type UserRole =
   | 'listener'
@@ -425,7 +439,7 @@ function isPrivilegedBroadcaster(role: UserRole): boolean {
 }
 
 // ======================================================
-// 9. FRONTEND HOME PAGE
+// 10. FRONTEND HOME PAGE
 // ======================================================
 
 app.get('/', (_req, res, next) => {
@@ -441,7 +455,7 @@ app.get('/', (_req, res, next) => {
 })
 
 // ======================================================
-// 10. AUTHENTICATION
+// 11. AUTHENTICATION
 // ======================================================
 
 async function getActor(
@@ -509,7 +523,7 @@ async function getAdmin(
 }
 
 // ======================================================
-// 11. AUDIT LOGGING
+// 12. AUDIT LOGGING
 // ======================================================
 
 async function writeAuditLog(
@@ -535,7 +549,7 @@ async function writeAuditLog(
 }
 
 // ======================================================
-// 12. HEALTH CHECKS
+// 13. HEALTH CHECKS
 // ======================================================
 
 app.get('/health', (_req, res) => {
@@ -561,7 +575,7 @@ app.get('/api/health', (_req, res) => {
 })
 
 // ======================================================
-// 13. RADIO: GET LIVE PROGRAMME
+// 14. RADIO: GET LIVE PROGRAMME
 // ======================================================
 
 async function getLiveProgramme(programmeId?: string) {
@@ -585,7 +599,7 @@ async function getLiveProgramme(programmeId?: string) {
 }
 
 // ======================================================
-// 14. RADIO: LIVEKIT ACCESS TOKEN
+// 15. RADIO: LIVEKIT ACCESS TOKEN
 // ======================================================
 
 app.post('/api/radio/token', async (req, res) => {
@@ -694,7 +708,7 @@ app.post('/api/radio/token', async (req, res) => {
 })
 
 // ======================================================
-// 15. ADMIN: OVERVIEW
+// 16. ADMIN: OVERVIEW
 // ======================================================
 
 app.get('/api/admin/overview', async (req, res) => {
@@ -730,15 +744,15 @@ app.get('/api/admin/overview', async (req, res) => {
       })
     ])
 
-    const queryErrors = [
+    const errors = [
       profiles.error,
       programmes.error,
       announcements.error,
       recordings.error
     ].filter(Boolean)
 
-    if (queryErrors.length) {
-      console.error('Admin overview query error:', queryErrors)
+    if (errors.length) {
+      console.error('Admin overview query errors:', errors)
       return sendError(res, 500, 'Unable to load administrator overview')
     }
 
@@ -753,17 +767,12 @@ app.get('/api/admin/overview', async (req, res) => {
     })
   } catch (error) {
     console.error('Admin overview error:', error)
-
-    return sendError(
-      res,
-      500,
-      'Unable to load administrator overview'
-    )
+    return sendError(res, 500, 'Unable to load administrator overview')
   }
 })
 
 // ======================================================
-// 16. ADMIN: LIST USERS
+// 17. ADMIN: LIST USERS
 // ======================================================
 
 app.get('/api/admin/users', async (req, res) => {
@@ -811,12 +820,7 @@ app.get('/api/admin/users', async (req, res) => {
 
       if (error) {
         console.error('Profiles lookup error:', error.message)
-
-        return sendError(
-          res,
-          500,
-          'Unable to retrieve user profiles'
-        )
+        return sendError(res, 500, 'Unable to retrieve user profiles')
       }
 
       profiles = (data || []) as Profile[]
@@ -850,13 +854,12 @@ app.get('/api/admin/users', async (req, res) => {
     })
   } catch (error) {
     console.error('List users error:', error)
-
     return sendError(res, 500, 'Unable to retrieve users')
   }
 })
 
 // ======================================================
-// 17. ADMIN: CHANGE USER ROLE
+// 18. ADMIN: CHANGE USER ROLE
 // ======================================================
 
 app.patch('/api/admin/users/:id/role', async (req, res) => {
@@ -937,13 +940,12 @@ app.patch('/api/admin/users/:id/role', async (req, res) => {
     })
   } catch (error) {
     console.error('Role update error:', error)
-
     return sendError(res, 500, 'Unable to update user role')
   }
 })
 
 // ======================================================
-// 18. ADMIN: ENABLE / DISABLE USER
+// 19. ADMIN: ENABLE / DISABLE USER
 // ======================================================
 
 app.patch('/api/admin/users/:id/status', async (req, res) => {
@@ -996,12 +998,7 @@ app.patch('/api/admin/users/:id/status', async (req, res) => {
 
     if (error) {
       console.error('Account status update error:', error.message)
-
-      return sendError(
-        res,
-        500,
-        'Unable to update account status'
-      )
+      return sendError(res, 500, 'Unable to update account status')
     }
 
     await writeAuditLog(
@@ -1021,17 +1018,12 @@ app.patch('/api/admin/users/:id/status', async (req, res) => {
     })
   } catch (error) {
     console.error('Account status error:', error)
-
-    return sendError(
-      res,
-      500,
-      'Unable to update account status'
-    )
+    return sendError(res, 500, 'Unable to update account status')
   }
 })
 
 // ======================================================
-// 19. ADMIN: AUDIT LOG
+// 20. ADMIN: AUDIT LOG
 // ======================================================
 
 app.get('/api/admin/audit', async (req, res) => {
@@ -1053,12 +1045,7 @@ app.get('/api/admin/audit', async (req, res) => {
 
     if (error) {
       console.error('Audit retrieval error:', error.message)
-
-      return sendError(
-        res,
-        500,
-        'Unable to retrieve audit logs'
-      )
+      return sendError(res, 500, 'Unable to retrieve audit logs')
     }
 
     return res.json({
@@ -1067,17 +1054,12 @@ app.get('/api/admin/audit', async (req, res) => {
     })
   } catch (error) {
     console.error('Audit endpoint error:', error)
-
-    return sendError(
-      res,
-      500,
-      'Unable to retrieve audit logs'
-    )
+    return sendError(res, 500, 'Unable to retrieve audit logs')
   }
 })
 
 // ======================================================
-// 20. RECORDING: START
+// 21. RECORDING: START
 // ======================================================
 
 app.post('/api/radio/recordings/start', async (req, res) => {
@@ -1116,12 +1098,7 @@ app.post('/api/radio/recordings/start', async (req, res) => {
 
     if (existingError) {
       console.error('Recording lookup error:', existingError.message)
-
-      return sendError(
-        res,
-        500,
-        'Unable to check existing recordings'
-      )
+      return sendError(res, 500, 'Unable to check existing recordings')
     }
 
     if (existingRecording) {
@@ -1165,11 +1142,7 @@ app.post('/api/radio/recordings/start', async (req, res) => {
     const egressId = egressInfo.egressId
 
     if (!egressId) {
-      return sendError(
-        res,
-        500,
-        'LiveKit did not return a recording ID'
-      )
+      return sendError(res, 500, 'LiveKit did not return a recording ID')
     }
 
     const { data: recording, error: insertError } =
@@ -1190,17 +1163,10 @@ app.post('/api/radio/recordings/start', async (req, res) => {
       try {
         await egressClient.stopEgress(egressId)
       } catch (stopError) {
-        console.error(
-          'Could not stop unregistered recording:',
-          stopError
-        )
+        console.error('Could not stop unregistered recording:', stopError)
       }
 
-      return sendError(
-        res,
-        500,
-        'Could not save recording information'
-      )
+      return sendError(res, 500, 'Could not save recording information')
     }
 
     await writeAuditLog(
@@ -1221,13 +1187,12 @@ app.post('/api/radio/recordings/start', async (req, res) => {
     })
   } catch (error) {
     console.error('Recording start error:', error)
-
     return sendError(res, 500, 'Unable to start recording')
   }
 })
 
 // ======================================================
-// 21. RECORDING: REFRESH
+// 22. RECORDING: REFRESH
 // ======================================================
 
 app.post('/api/radio/recordings/refresh', async (req, res) => {
@@ -1253,12 +1218,7 @@ app.post('/api/radio/recordings/refresh', async (req, res) => {
 
     if (error) {
       console.error('Recording refresh error:', error.message)
-
-      return sendError(
-        res,
-        500,
-        'Unable to refresh recordings'
-      )
+      return sendError(res, 500, 'Unable to refresh recordings')
     }
 
     return res.json({
@@ -1267,17 +1227,12 @@ app.post('/api/radio/recordings/refresh', async (req, res) => {
     })
   } catch (error) {
     console.error('Recording refresh error:', error)
-
-    return sendError(
-      res,
-      500,
-      'Unable to refresh recordings'
-    )
+    return sendError(res, 500, 'Unable to refresh recordings')
   }
 })
 
 // ======================================================
-// 22. RECORDING: STOP
+// 23. RECORDING: STOP
 // ======================================================
 
 app.post('/api/radio/recordings/stop', async (req, res) => {
@@ -1355,20 +1310,17 @@ app.post('/api/radio/recordings/stop', async (req, res) => {
     })
   } catch (error) {
     console.error('Recording stop error:', error)
-
     return sendError(res, 500, 'Unable to stop recording')
   }
 })
 
 // ======================================================
-// 23. ROOT ADMIN BOOTSTRAP
+// 24. ROOT ADMIN BOOTSTRAP
 // ======================================================
 
 async function bootstrapRootAdmin() {
   if (!ROOT_ADMIN_EMAIL) {
-    console.log(
-      'ROOT_ADMIN_EMAIL not configured; skipping bootstrap'
-    )
+    console.log('ROOT_ADMIN_EMAIL not configured; skipping bootstrap')
     return
   }
 
@@ -1419,24 +1371,21 @@ async function bootstrapRootAdmin() {
       return
     }
 
-    console.log(
-      'Root Admin verified and configured:',
-      ROOT_ADMIN_EMAIL
-    )
+    console.log('Root Admin verified and configured:', ROOT_ADMIN_EMAIL)
   } catch (error) {
     console.error('Root Admin bootstrap failed:', error)
   }
 }
 
 // ======================================================
-// 24. REACT SINGLE-PAGE APPLICATION ROUTING
+// 25. SINGLE-PAGE APPLICATION ROUTING
 // ======================================================
 
 app.use((req, res, next) => {
   if (
     req.method !== 'GET' ||
-    req.path === '/health' ||
     req.path.startsWith('/api/') ||
+    req.path === '/health' ||
     req.path === '/api'
   ) {
     return next()
@@ -1456,7 +1405,7 @@ app.use((req, res, next) => {
 })
 
 // ======================================================
-// 25. 404 HANDLER
+// 26. 404 HANDLER
 // ======================================================
 
 app.use((req, res) => {
@@ -1468,7 +1417,7 @@ app.use((req, res) => {
 })
 
 // ======================================================
-// 26. GLOBAL ERROR HANDLER
+// 27. GLOBAL ERROR HANDLER
 // ======================================================
 
 app.use((
@@ -1484,7 +1433,10 @@ app.use((
   const message =
     error instanceof Error ? error.message : ''
 
-  if (message === 'Origin not allowed by CORS') {
+  if (
+    message === 'Origin not allowed by CORS' ||
+    message === 'Invalid request origin'
+  ) {
     return res.status(403).json({
       success: false,
       error: 'This website is not allowed to access the radio API'
@@ -1498,7 +1450,7 @@ app.use((
 })
 
 // ======================================================
-// 27. START SERVER
+// 28. START SERVER
 // ======================================================
 
 const server = createServer(app)
@@ -1526,7 +1478,7 @@ server.listen(PORT, '0.0.0.0', () => {
 })
 
 // ======================================================
-// 28. GRACEFUL SHUTDOWN
+// 29. GRACEFUL SHUTDOWN
 // ======================================================
 
 function shutdown(signal: string) {
