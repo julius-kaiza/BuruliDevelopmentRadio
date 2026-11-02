@@ -26,14 +26,16 @@ import { resolve, join } from 'node:path'
 import { existsSync } from 'node:fs'
 
 // ======================================================
-// ENVIRONMENT CONFIGURATION
+// 1. ENVIRONMENT CONFIGURATION
 // ======================================================
 
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim()
 
   if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`)
+    throw new Error(
+      `Missing required environment variable: ${name}`
+    )
   }
 
   return value
@@ -46,26 +48,31 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
 }
 
 const SUPABASE_URL = requiredEnv('SUPABASE_URL')
-const SUPABASE_SERVICE_ROLE_KEY = requiredEnv('SUPABASE_SERVICE_ROLE_KEY')
+const SUPABASE_SERVICE_ROLE_KEY = requiredEnv(
+  'SUPABASE_SERVICE_ROLE_KEY'
+)
 
 const LIVEKIT_URL = requiredEnv('LIVEKIT_URL')
 const LIVEKIT_API_KEY = requiredEnv('LIVEKIT_API_KEY')
 const LIVEKIT_API_SECRET = requiredEnv('LIVEKIT_API_SECRET')
 
-const ROOT_ADMIN_EMAIL = process.env.ROOT_ADMIN_EMAIL?.trim().toLowerCase()
+const ROOT_ADMIN_EMAIL = process.env.ROOT_ADMIN_EMAIL
+  ?.trim()
+  .toLowerCase()
 
 const FRONTEND_ORIGINS = (
   process.env.FRONTEND_ORIGIN || ''
 )
   .split(',')
-  .map(value => value.trim().replace(/\/$/, ''))
+  .map(value => value.trim().replace(/\/+$/, ''))
   .filter(Boolean)
 
 const RECORDING_BUCKET = process.env.RECORDING_BUCKET?.trim()
 const RECORDING_ENDPOINT = process.env.RECORDING_ENDPOINT?.trim()
 const RECORDING_ACCESS_KEY = process.env.RECORDING_ACCESS_KEY?.trim()
 const RECORDING_SECRET_KEY = process.env.RECORDING_SECRET_KEY?.trim()
-const RECORDING_REGION = process.env.RECORDING_REGION?.trim() || 'auto'
+const RECORDING_REGION =
+  process.env.RECORDING_REGION?.trim() || 'auto'
 
 const recordingSettings = [
   RECORDING_BUCKET,
@@ -78,26 +85,48 @@ const RECORDING_CONFIGURED = recordingSettings.every(Boolean)
 
 if (recordingSettings.some(Boolean) && !RECORDING_CONFIGURED) {
   throw new Error(
-    'Recording configuration is incomplete. Configure RECORDING_BUCKET, RECORDING_ENDPOINT, RECORDING_ACCESS_KEY and RECORDING_SECRET_KEY.'
+    'Incomplete recording configuration. Configure RECORDING_BUCKET, RECORDING_ENDPOINT, RECORDING_ACCESS_KEY and RECORDING_SECRET_KEY.'
   )
 }
 
-if (!SUPABASE_URL.startsWith('https://')) {
+// Validate Supabase URL.
+let supabaseOrigin: string
+
+try {
+  const parsed = new URL(SUPABASE_URL)
+
+  if (parsed.protocol !== 'https:') {
+    throw new Error()
+  }
+
+  supabaseOrigin = parsed.origin
+} catch {
   throw new Error('SUPABASE_URL must be a valid HTTPS URL')
 }
 
-if (!/^wss?:\/\//i.test(LIVEKIT_URL)) {
-  throw new Error('LIVEKIT_URL must begin with wss:// or ws://')
+// Validate LiveKit URL.
+let livekitParsedUrl: URL
+
+try {
+  livekitParsedUrl = new URL(LIVEKIT_URL)
+
+  if (
+    livekitParsedUrl.protocol !== 'wss:' &&
+    livekitParsedUrl.protocol !== 'ws:'
+  ) {
+    throw new Error()
+  }
+} catch {
+  throw new Error('LIVEKIT_URL must be a valid wss:// or ws:// URL')
 }
 
-// Convert LiveKit WebSocket URL to HTTP URL for Egress.
-
+// Convert LiveKit WebSocket URL to HTTP for Egress.
 const LIVEKIT_HTTP_URL = LIVEKIT_URL
   .replace(/^wss:\/\//i, 'https://')
   .replace(/^ws:\/\//i, 'http://')
 
 // ======================================================
-// CLIENTS
+// 2. CLIENTS
 // ======================================================
 
 const supabase = createClient(
@@ -118,18 +147,235 @@ const egressClient = new EgressClient(
 )
 
 // ======================================================
-// FRONTEND CONFIGURATION
+// 3. FRONTEND FILE CONFIGURATION
 // ======================================================
 
 const PUBLIC_DIR = resolve(process.cwd(), 'public')
 const INDEX_FILE = join(PUBLIC_DIR, 'index.html')
 
-console.log('Frontend directory:', PUBLIC_DIR)
-console.log('Frontend index exists:', existsSync(INDEX_FILE))
+// ======================================================
+// 4. CONTENT SECURITY POLICY
+// ======================================================
+
+// Add both HTTP and WebSocket origins for configured services.
+// Supabase Realtime uses secure WebSockets.
+// LiveKit uses WebSocket signalling and HTTPS endpoints.
+
+function getCspServiceOrigins(serviceUrl: string): string[] {
+  const parsed = new URL(serviceUrl)
+  const sources = [parsed.origin]
+
+  if (parsed.protocol === 'https:') {
+    sources.push(`wss://${parsed.host}`)
+  }
+
+  if (parsed.protocol === 'http:') {
+    sources.push(`ws://${parsed.host}`)
+  }
+
+  if (parsed.protocol === 'wss:') {
+    sources.push(`https://${parsed.host}`)
+  }
+
+  if (parsed.protocol === 'ws:') {
+    sources.push(`http://${parsed.host}`)
+  }
+
+  return sources
+}
+
+const connectSources = [
+  "'self'",
+  ...getCspServiceOrigins(SUPABASE_URL),
+  ...getCspServiceOrigins(LIVEKIT_URL)
+]
+
+const uniqueConnectSources = [
+  ...new Set(connectSources)
+]
 
 // ======================================================
-// TYPES
+// 5. EXPRESS APPLICATION
 // ======================================================
+
+const app = express()
+
+app.set('trust proxy', 1)
+app.disable('x-powered-by')
+
+// IMPORTANT:
+// Explicitly allow Supabase and LiveKit in connect-src.
+// This fixes the previous default-src 'self' restriction.
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+
+        baseUri: ["'self'"],
+
+        formAction: ["'self'"],
+
+        frameAncestors: ["'self'"],
+
+        objectSrc: ["'none'"],
+
+        scriptSrc: ["'self'"],
+
+        scriptSrcAttr: ["'none'"],
+
+        styleSrc: [
+          "'self'",
+          "'unsafe-inline'",
+          'https:'
+        ],
+
+        fontSrc: [
+          "'self'",
+          'https:',
+          'data:'
+        ],
+
+        imgSrc: [
+          "'self'",
+          'https:',
+          'data:',
+          'blob:'
+        ],
+
+        connectSrc: uniqueConnectSources,
+
+        mediaSrc: [
+          "'self'",
+          'https:',
+          'blob:'
+        ],
+
+        workerSrc: [
+          "'self'",
+          'blob:'
+        ]
+      }
+    }
+  })
+)
+
+// ======================================================
+// 6. CORS CONFIGURATION
+// ======================================================
+
+app.use(
+  cors({
+    credentials: true,
+
+    methods: [
+      'GET',
+      'POST',
+      'PUT',
+      'PATCH',
+      'DELETE',
+      'OPTIONS'
+    ],
+
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'apikey',
+      'x-client-info'
+    ],
+
+    origin(origin, callback) {
+      // Permit server-to-server and command-line requests.
+      if (!origin) {
+        return callback(null, true)
+      }
+
+      try {
+        const normalizedOrigin = new URL(origin).origin
+
+        // Explicitly configured frontend origins.
+        if (FRONTEND_ORIGINS.includes(normalizedOrigin)) {
+          return callback(null, true)
+        }
+
+        // Permit same-origin requests.
+        // This uses the current request, not a global app setting.
+        const requestHost = app.locals.requestHost
+
+        if (requestHost && new URL(origin).host === requestHost) {
+          return callback(null, true)
+        }
+      } catch {
+        // Invalid origins are rejected below.
+      }
+
+      return callback(
+        new Error('Origin not allowed by CORS')
+      )
+    }
+  })
+)
+
+// Record the current request host before the CORS check
+// on subsequent requests.
+
+app.use((req, _res, next) => {
+  app.locals.requestHost = req.get('host')
+  next()
+})
+
+// NOTE:
+// The CORS middleware above uses the current host only when
+// app.locals.requestHost has been populated. Explicit
+// FRONTEND_ORIGIN is therefore required for separate sites.
+
+app.use(express.json({ limit: '1mb' }))
+
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 300,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false
+  })
+)
+
+// ======================================================
+// 7. FRONTEND STATIC FILES
+// ======================================================
+
+app.use(
+  express.static(PUBLIC_DIR, {
+    index: false,
+    fallthrough: true
+  })
+)
+
+// ======================================================
+// 8. GENERAL HELPERS
+// ======================================================
+
+function sendError(
+  res: Response,
+  status: number,
+  message: string
+) {
+  return res.status(status).json({
+    success: false,
+    error: message
+  })
+}
+
+function getBearerToken(req: Request): string | null {
+  const header = req.headers.authorization
+
+  if (!header || !header.startsWith('Bearer ')) {
+    return null
+  }
+
+  return header.slice(7).trim() || null
+}
 
 type UserRole =
   | 'listener'
@@ -171,112 +417,6 @@ const PRIVILEGED_BROADCAST_ROLES: UserRole[] = [
   'root_admin'
 ]
 
-// ======================================================
-// EXPRESS APPLICATION
-// ======================================================
-
-const app = express()
-
-app.set('trust proxy', 1)
-app.disable('x-powered-by')
-
-app.use(helmet())
-
-app.use(express.json({ limit: '1mb' }))
-
-// ======================================================
-// CORS
-// ======================================================
-
-app.use(
-  cors({
-    credentials: true,
-
-    origin(origin, callback) {
-      // Requests without an Origin header are permitted.
-      if (!origin) {
-        return callback(null, true)
-      }
-
-      const normalizedOrigin = origin.replace(/\/$/, '')
-
-      // Explicitly configured frontend origins.
-      if (FRONTEND_ORIGINS.includes(normalizedOrigin)) {
-        return callback(null, true)
-      }
-
-      // Allow the same Render domain hosting this application.
-      try {
-        const originHost = new URL(origin).host
-        const requestHost = app.get('requestHost')
-
-        if (requestHost && originHost === requestHost) {
-          return callback(null, true)
-        }
-      } catch {
-        // Invalid origin is rejected below.
-      }
-
-      return callback(new Error('Origin not allowed by CORS'))
-    }
-  })
-)
-
-// Set the actual request host for same-origin CORS checks.
-app.use((req, _res, next) => {
-  app.set('requestHost', req.get('host'))
-  next()
-})
-
-app.use(
-  rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 300,
-    standardHeaders: 'draft-8',
-    legacyHeaders: false
-  })
-)
-
-// ======================================================
-// FRONTEND STATIC FILES
-// ======================================================
-
-// Serve React JavaScript, CSS, images, fonts and other assets.
-// index:false ensures Express does not automatically override
-// the explicit root route below.
-
-app.use(
-  express.static(PUBLIC_DIR, {
-    index: false,
-    fallthrough: true
-  })
-)
-
-// ======================================================
-// GENERAL HELPERS
-// ======================================================
-
-function sendError(
-  res: Response,
-  status: number,
-  message: string
-) {
-  return res.status(status).json({
-    success: false,
-    error: message
-  })
-}
-
-function getBearerToken(req: Request): string | null {
-  const header = req.headers.authorization
-
-  if (!header || !header.startsWith('Bearer ')) {
-    return null
-  }
-
-  return header.slice(7).trim() || null
-}
-
 function isAdmin(role: UserRole): boolean {
   return ADMIN_ROLES.includes(role)
 }
@@ -286,7 +426,7 @@ function isPrivilegedBroadcaster(role: UserRole): boolean {
 }
 
 // ======================================================
-// FRONTEND HOME PAGE
+// 9. FRONTEND HOME PAGE
 // ======================================================
 
 app.get('/', (_req, res, next) => {
@@ -302,7 +442,7 @@ app.get('/', (_req, res, next) => {
 })
 
 // ======================================================
-// AUTHENTICATION
+// 10. AUTHENTICATION
 // ======================================================
 
 async function getActor(
@@ -370,7 +510,7 @@ async function getAdmin(
 }
 
 // ======================================================
-// AUDIT LOGGING
+// 11. AUDIT LOGGING
 // ======================================================
 
 async function writeAuditLog(
@@ -396,7 +536,7 @@ async function writeAuditLog(
 }
 
 // ======================================================
-// HEALTH CHECKS
+// 12. HEALTH CHECKS
 // ======================================================
 
 app.get('/health', (_req, res) => {
@@ -408,7 +548,8 @@ app.get('/health', (_req, res) => {
     timestamp: new Date().toISOString(),
     livekitConfigured: Boolean(LIVEKIT_URL),
     supabaseConfigured: Boolean(SUPABASE_URL),
-    recordingConfigured: RECORDING_CONFIGURED
+    recordingConfigured: RECORDING_CONFIGURED,
+    frontendAvailable: existsSync(INDEX_FILE)
   })
 })
 
@@ -421,7 +562,7 @@ app.get('/api/health', (_req, res) => {
 })
 
 // ======================================================
-// RADIO: GET LIVE PROGRAMME
+// 13. RADIO: GET LIVE PROGRAMME
 // ======================================================
 
 async function getLiveProgramme(programmeId?: string) {
@@ -437,6 +578,7 @@ async function getLiveProgramme(programmeId?: string) {
   const { data, error } = await query.limit(1).maybeSingle()
 
   if (error) {
+    console.error('Live programme lookup error:', error.message)
     throw new Error('Could not retrieve the live programme')
   }
 
@@ -444,7 +586,7 @@ async function getLiveProgramme(programmeId?: string) {
 }
 
 // ======================================================
-// RADIO: LIVEKIT ACCESS TOKEN
+// 14. RADIO: LIVEKIT ACCESS TOKEN
 // ======================================================
 
 app.post('/api/radio/token', async (req, res) => {
@@ -491,8 +633,16 @@ app.post('/api/radio/token', async (req, res) => {
           .maybeSingle()
 
         if (error) {
-          console.error('Speaker approval lookup failed:', error.message)
-          return sendError(res, 500, 'Could not verify speaker permissions')
+          console.error(
+            'Speaker approval lookup failed:',
+            error.message
+          )
+
+          return sendError(
+            res,
+            500,
+            'Could not verify speaker permissions'
+          )
         }
 
         canPublish = Boolean(speakerRequest)
@@ -522,6 +672,7 @@ app.post('/api/radio/token', async (req, res) => {
     return res.json({
       success: true,
       token: jwt,
+      url: LIVEKIT_URL,
       serverUrl: LIVEKIT_URL,
       identity,
       displayName,
@@ -534,12 +685,17 @@ app.post('/api/radio/token', async (req, res) => {
     })
   } catch (error) {
     console.error('Radio token error:', error)
-    return sendError(res, 500, 'Unable to create radio access token')
+
+    return sendError(
+      res,
+      500,
+      'Unable to create radio access token'
+    )
   }
 })
 
 // ======================================================
-// ADMIN: OVERVIEW
+// 15. ADMIN: OVERVIEW
 // ======================================================
 
 app.get('/api/admin/overview', async (req, res) => {
@@ -575,6 +731,18 @@ app.get('/api/admin/overview', async (req, res) => {
       })
     ])
 
+    const queryErrors = [
+      profiles.error,
+      programmes.error,
+      announcements.error,
+      recordings.error
+    ].filter(Boolean)
+
+    if (queryErrors.length) {
+      console.error('Admin overview query error:', queryErrors)
+      return sendError(res, 500, 'Unable to load administrator overview')
+    }
+
     return res.json({
       success: true,
       overview: {
@@ -586,12 +754,17 @@ app.get('/api/admin/overview', async (req, res) => {
     })
   } catch (error) {
     console.error('Admin overview error:', error)
-    return sendError(res, 500, 'Unable to load administrator overview')
+
+    return sendError(
+      res,
+      500,
+      'Unable to load administrator overview'
+    )
   }
 })
 
 // ======================================================
-// ADMIN: LIST USERS
+// 16. ADMIN: LIST USERS
 // ======================================================
 
 app.get('/api/admin/users', async (req, res) => {
@@ -606,7 +779,10 @@ app.get('/api/admin/users', async (req, res) => {
       Math.max(1, Number(req.query.limit) || 50)
     )
 
-    if (!Number.isSafeInteger(page) || !Number.isSafeInteger(perPage)) {
+    if (
+      !Number.isSafeInteger(page) ||
+      !Number.isSafeInteger(perPage)
+    ) {
       return sendError(res, 400, 'Invalid pagination parameters')
     }
 
@@ -636,7 +812,12 @@ app.get('/api/admin/users', async (req, res) => {
 
       if (error) {
         console.error('Profiles lookup error:', error.message)
-        return sendError(res, 500, 'Unable to retrieve user profiles')
+
+        return sendError(
+          res,
+          500,
+          'Unable to retrieve user profiles'
+        )
       }
 
       profiles = (data || []) as Profile[]
@@ -670,12 +851,13 @@ app.get('/api/admin/users', async (req, res) => {
     })
   } catch (error) {
     console.error('List users error:', error)
+
     return sendError(res, 500, 'Unable to retrieve users')
   }
 })
 
 // ======================================================
-// ADMIN: CHANGE USER ROLE
+// 17. ADMIN: CHANGE USER ROLE
 // ======================================================
 
 app.patch('/api/admin/users/:id/role', async (req, res) => {
@@ -699,14 +881,19 @@ app.patch('/api/admin/users/:id/role', async (req, res) => {
       newRole === 'root_admin' &&
       actor.profile.role !== 'root_admin'
     ) {
-      return sendError(res, 403, 'Only the Root Admin can assign Root Admin')
+      return sendError(
+        res,
+        403,
+        'Only the Root Admin can assign Root Admin'
+      )
     }
 
-    const { data: targetProfile, error: lookupError } = await supabase
-      .from('profiles')
-      .select('id, role')
-      .eq('id', targetId)
-      .maybeSingle()
+    const { data: targetProfile, error: lookupError } =
+      await supabase
+        .from('profiles')
+        .select('id, role')
+        .eq('id', targetId)
+        .maybeSingle()
 
     if (lookupError || !targetProfile) {
       return sendError(res, 404, 'Target user profile not found')
@@ -716,7 +903,11 @@ app.patch('/api/admin/users/:id/role', async (req, res) => {
       targetProfile.role === 'root_admin' &&
       actor.profile.role !== 'root_admin'
     ) {
-      return sendError(res, 403, 'Only the Root Admin can modify this account')
+      return sendError(
+        res,
+        403,
+        'Only the Root Admin can modify this account'
+      )
     }
 
     const { error } = await supabase
@@ -747,12 +938,13 @@ app.patch('/api/admin/users/:id/role', async (req, res) => {
     })
   } catch (error) {
     console.error('Role update error:', error)
+
     return sendError(res, 500, 'Unable to update user role')
   }
 })
 
 // ======================================================
-// ADMIN: ENABLE / DISABLE USER
+// 18. ADMIN: ENABLE / DISABLE USER
 // ======================================================
 
 app.patch('/api/admin/users/:id/status', async (req, res) => {
@@ -765,18 +957,23 @@ app.patch('/api/admin/users/:id/status', async (req, res) => {
     const isActive = req.body?.isActive
 
     if (!targetId || typeof isActive !== 'boolean') {
-      return sendError(res, 400, 'A valid user ID and isActive value are required')
+      return sendError(
+        res,
+        400,
+        'A valid user ID and isActive value are required'
+      )
     }
 
     if (targetId === actor.user.id) {
       return sendError(res, 400, 'You cannot disable your own account')
     }
 
-    const { data: targetProfile, error: lookupError } = await supabase
-      .from('profiles')
-      .select('id, role')
-      .eq('id', targetId)
-      .maybeSingle()
+    const { data: targetProfile, error: lookupError } =
+      await supabase
+        .from('profiles')
+        .select('id, role')
+        .eq('id', targetId)
+        .maybeSingle()
 
     if (lookupError || !targetProfile) {
       return sendError(res, 404, 'Target user profile not found')
@@ -786,7 +983,11 @@ app.patch('/api/admin/users/:id/status', async (req, res) => {
       targetProfile.role === 'root_admin' &&
       actor.profile.role !== 'root_admin'
     ) {
-      return sendError(res, 403, 'Only the Root Admin can modify this account')
+      return sendError(
+        res,
+        403,
+        'Only the Root Admin can modify this account'
+      )
     }
 
     const { error } = await supabase
@@ -796,7 +997,12 @@ app.patch('/api/admin/users/:id/status', async (req, res) => {
 
     if (error) {
       console.error('Account status update error:', error.message)
-      return sendError(res, 500, 'Unable to update account status')
+
+      return sendError(
+        res,
+        500,
+        'Unable to update account status'
+      )
     }
 
     await writeAuditLog(
@@ -816,12 +1022,17 @@ app.patch('/api/admin/users/:id/status', async (req, res) => {
     })
   } catch (error) {
     console.error('Account status error:', error)
-    return sendError(res, 500, 'Unable to update account status')
+
+    return sendError(
+      res,
+      500,
+      'Unable to update account status'
+    )
   }
 })
 
 // ======================================================
-// ADMIN: AUDIT LOG
+// 19. ADMIN: AUDIT LOG
 // ======================================================
 
 app.get('/api/admin/audit', async (req, res) => {
@@ -843,7 +1054,12 @@ app.get('/api/admin/audit', async (req, res) => {
 
     if (error) {
       console.error('Audit retrieval error:', error.message)
-      return sendError(res, 500, 'Unable to retrieve audit logs')
+
+      return sendError(
+        res,
+        500,
+        'Unable to retrieve audit logs'
+      )
     }
 
     return res.json({
@@ -852,12 +1068,17 @@ app.get('/api/admin/audit', async (req, res) => {
     })
   } catch (error) {
     console.error('Audit endpoint error:', error)
-    return sendError(res, 500, 'Unable to retrieve audit logs')
+
+    return sendError(
+      res,
+      500,
+      'Unable to retrieve audit logs'
+    )
   }
 })
 
 // ======================================================
-// RECORDING: START
+// 20. RECORDING: START
 // ======================================================
 
 app.post('/api/radio/recordings/start', async (req, res) => {
@@ -896,14 +1117,25 @@ app.post('/api/radio/recordings/start', async (req, res) => {
 
     if (existingError) {
       console.error('Recording lookup error:', existingError.message)
-      return sendError(res, 500, 'Unable to check existing recordings')
+
+      return sendError(
+        res,
+        500,
+        'Unable to check existing recordings'
+      )
     }
 
     if (existingRecording) {
-      return sendError(res, 409, 'This programme is already being recorded')
+      return sendError(
+        res,
+        409,
+        'This programme is already being recorded'
+      )
     }
 
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, '-')
 
     const objectPath =
       `buruli-radio/${programme.id}/${timestamp}-${randomUUID()}.ogg`
@@ -922,30 +1154,36 @@ app.post('/api/radio/recordings/start', async (req, res) => {
       }
     })
 
-    const egressInfo = await egressClient.startRoomCompositeEgress(
-      programme.room_name,
-      output,
-      {
-        audioOnly: true
-      }
-    )
+    const egressInfo =
+      await egressClient.startRoomCompositeEgress(
+        programme.room_name,
+        output,
+        {
+          audioOnly: true
+        }
+      )
 
     const egressId = egressInfo.egressId
 
     if (!egressId) {
-      return sendError(res, 500, 'LiveKit did not return a recording ID')
+      return sendError(
+        res,
+        500,
+        'LiveKit did not return a recording ID'
+      )
     }
 
-    const { data: recording, error: insertError } = await supabase
-      .from('radio_recordings')
-      .insert({
-        programme_id: programme.id,
-        egress_id: egressId,
-        object_path: objectPath,
-        status: 'recording'
-      })
-      .select('*')
-      .single()
+    const { data: recording, error: insertError } =
+      await supabase
+        .from('radio_recordings')
+        .insert({
+          programme_id: programme.id,
+          egress_id: egressId,
+          object_path: objectPath,
+          status: 'recording'
+        })
+        .select('*')
+        .single()
 
     if (insertError) {
       console.error('Recording database error:', insertError.message)
@@ -953,10 +1191,17 @@ app.post('/api/radio/recordings/start', async (req, res) => {
       try {
         await egressClient.stopEgress(egressId)
       } catch (stopError) {
-        console.error('Could not stop unregistered recording:', stopError)
+        console.error(
+          'Could not stop unregistered recording:',
+          stopError
+        )
       }
 
-      return sendError(res, 500, 'Could not save recording information')
+      return sendError(
+        res,
+        500,
+        'Could not save recording information'
+      )
     }
 
     await writeAuditLog(
@@ -977,12 +1222,13 @@ app.post('/api/radio/recordings/start', async (req, res) => {
     })
   } catch (error) {
     console.error('Recording start error:', error)
+
     return sendError(res, 500, 'Unable to start recording')
   }
 })
 
 // ======================================================
-// RECORDING: REFRESH
+// 21. RECORDING: REFRESH
 // ======================================================
 
 app.post('/api/radio/recordings/refresh', async (req, res) => {
@@ -1008,7 +1254,12 @@ app.post('/api/radio/recordings/refresh', async (req, res) => {
 
     if (error) {
       console.error('Recording refresh error:', error.message)
-      return sendError(res, 500, 'Unable to refresh recordings')
+
+      return sendError(
+        res,
+        500,
+        'Unable to refresh recordings'
+      )
     }
 
     return res.json({
@@ -1017,12 +1268,17 @@ app.post('/api/radio/recordings/refresh', async (req, res) => {
     })
   } catch (error) {
     console.error('Recording refresh error:', error)
-    return sendError(res, 500, 'Unable to refresh recordings')
+
+    return sendError(
+      res,
+      500,
+      'Unable to refresh recordings'
+    )
   }
 })
 
 // ======================================================
-// RECORDING: STOP
+// 22. RECORDING: STOP
 // ======================================================
 
 app.post('/api/radio/recordings/stop', async (req, res) => {
@@ -1040,18 +1296,23 @@ app.post('/api/radio/recordings/stop', async (req, res) => {
       return sendError(res, 400, 'Recording ID is required')
     }
 
-    const { data: recording, error: lookupError } = await supabase
-      .from('radio_recordings')
-      .select('*')
-      .eq('id', recordingId)
-      .maybeSingle()
+    const { data: recording, error: lookupError } =
+      await supabase
+        .from('radio_recordings')
+        .select('*')
+        .eq('id', recordingId)
+        .maybeSingle()
 
     if (lookupError || !recording) {
       return sendError(res, 404, 'Recording not found')
     }
 
     if (recording.status !== 'recording') {
-      return sendError(res, 409, 'This recording is not currently active')
+      return sendError(
+        res,
+        409,
+        'This recording is not currently active'
+      )
     }
 
     await egressClient.stopEgress(recording.egress_id)
@@ -1069,7 +1330,12 @@ app.post('/api/radio/recordings/stop', async (req, res) => {
 
     if (updateError) {
       console.error('Recording update error:', updateError.message)
-      return sendError(res, 500, 'Recording stopped but database update failed')
+
+      return sendError(
+        res,
+        500,
+        'Recording stopped but database update failed'
+      )
     }
 
     await writeAuditLog(
@@ -1090,28 +1356,29 @@ app.post('/api/radio/recordings/stop', async (req, res) => {
     })
   } catch (error) {
     console.error('Recording stop error:', error)
+
     return sendError(res, 500, 'Unable to stop recording')
   }
 })
 
 // ======================================================
-// ROOT ADMIN BOOTSTRAP
+// 23. ROOT ADMIN BOOTSTRAP
 // ======================================================
 
 async function bootstrapRootAdmin() {
   if (!ROOT_ADMIN_EMAIL) {
-    console.log('ROOT_ADMIN_EMAIL not configured; skipping bootstrap')
+    console.log(
+      'ROOT_ADMIN_EMAIL not configured; skipping bootstrap'
+    )
     return
   }
 
   try {
-    const {
-      data,
-      error
-    } = await supabase.auth.admin.listUsers({
-      page: 1,
-      perPage: 1000
-    })
+    const { data, error } =
+      await supabase.auth.admin.listUsers({
+        page: 1,
+        perPage: 1000
+      })
 
     if (error) {
       console.error('Root Admin bootstrap error:', error.message)
@@ -1153,18 +1420,18 @@ async function bootstrapRootAdmin() {
       return
     }
 
-    console.log('Root Admin verified and configured:', ROOT_ADMIN_EMAIL)
+    console.log(
+      'Root Admin verified and configured:',
+      ROOT_ADMIN_EMAIL
+    )
   } catch (error) {
     console.error('Root Admin bootstrap failed:', error)
   }
 }
 
 // ======================================================
-// REACT SINGLE-PAGE APPLICATION ROUTING
+// 24. REACT SINGLE-PAGE APPLICATION ROUTING
 // ======================================================
-
-// All API endpoints above are registered first.
-// This fallback serves React for browser page routes.
 
 app.use((req, res, next) => {
   if (
@@ -1190,7 +1457,7 @@ app.use((req, res, next) => {
 })
 
 // ======================================================
-// 404 HANDLER
+// 25. 404 HANDLER
 // ======================================================
 
 app.use((req, res) => {
@@ -1202,7 +1469,7 @@ app.use((req, res) => {
 })
 
 // ======================================================
-// ERROR HANDLER
+// 26. GLOBAL ERROR HANDLER
 // ======================================================
 
 app.use((
@@ -1215,14 +1482,24 @@ app.use((
 
   if (res.headersSent) return
 
-  res.status(500).json({
+  const message =
+    error instanceof Error ? error.message : ''
+
+  if (message === 'Origin not allowed by CORS') {
+    return res.status(403).json({
+      success: false,
+      error: 'This website is not allowed to access the radio API'
+    })
+  }
+
+  return res.status(500).json({
     success: false,
     error: 'Internal server error'
   })
 })
 
 // ======================================================
-// START SERVER
+// 27. START SERVER
 // ======================================================
 
 const server = createServer(app)
@@ -1232,14 +1509,17 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('========================================')
   console.log(' BURULI DEVELOPMENT RADIO')
   console.log('========================================')
-  console.log(`Server running on port ${PORT}`)
+  console.log(`Server running on port: ${PORT}`)
   console.log(`Frontend directory: ${PUBLIC_DIR}`)
   console.log(`Frontend available: ${existsSync(INDEX_FILE)}`)
+  console.log(`Supabase: ${supabaseOrigin}`)
   console.log(`LiveKit: ${LIVEKIT_URL}`)
-  console.log('Supabase: Configured')
   console.log(
-    `Recording storage: ${RECORDING_CONFIGURED ? 'Configured' : 'Not configured'}`
+    `Recording storage: ${
+      RECORDING_CONFIGURED ? 'Configured' : 'Not configured'
+    }`
   )
+  console.log('CSP: Supabase and LiveKit connections allowed')
   console.log('========================================')
   console.log('')
 
@@ -1247,7 +1527,7 @@ server.listen(PORT, '0.0.0.0', () => {
 })
 
 // ======================================================
-// GRACEFUL SHUTDOWN
+// 28. GRACEFUL SHUTDOWN
 // ======================================================
 
 function shutdown(signal: string) {
